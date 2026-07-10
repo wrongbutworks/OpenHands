@@ -160,11 +160,15 @@ def test_migration_rewrites_legacy_profiles_and_agent_settings_secrets():
         'AGENT_TOKEN': 'agent-context-secret'
     }
     assert (
-        loaded.agent_settings.mcp_config.mcpServers['http'].headers['Authorization']
+        loaded.agent_settings.mcp_config['http']
+        .auth.headers['Authorization']
+        .get_secret_value()
         == 'Bearer header-secret'
     )
     assert (
-        loaded.agent_settings.mcp_config.mcpServers['stdio'].env['MCP_ENV_TOKEN']
+        loaded.agent_settings.mcp_config['stdio']
+        .env['MCP_ENV_TOKEN']
+        .get_secret_value()
         == 'env-secret'
     )
 

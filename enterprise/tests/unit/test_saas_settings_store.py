@@ -632,6 +632,71 @@ async def test_store_updates_org_defaults_and_all_members_for_shared_keys(
 
 
 @pytest.mark.asyncio
+async def test_store_rejects_resolved_profile_settings_view(
+    session_maker, async_session_maker, org_with_multiple_members_fixture
+):
+    """``store()`` refuses a resolved Agent-Profile launch view outright.
+
+    A resolved view (``load(resolve_agent_profile=True)`` / an override) is
+    the profile's dump — ref-filtered ``mcp_config``, the referenced LLM
+    profile's key — not user-authored settings. Persisting it would corrupt
+    the member/org rows, so ``store()`` raises before writing anything.
+    """
+    from sqlalchemy import select
+    from storage.org import Org
+    from storage.org_member import OrgMember
+
+    fixture = org_with_multiple_members_fixture
+    org_id = fixture['org_id']
+    admin_user_id = str(fixture['admin_user_id'])
+
+    store = SaasSettingsStore(admin_user_id)
+    resolved_settings = _make_settings(
+        model='anthropic/claude-sonnet-4',
+        base_url='https://api.anthropic.com/v1',
+        api_key='profile-resolved-secret-key',
+    )
+    # Marks agent_settings as profile-resolved, exactly as load() would when
+    # the caller requested resolution and the member has an active profile.
+    resolved_settings.active_agent_profile_id = 'profile-1'
+    resolved_settings.active_agent_profile_revision = 3
+    resolved_settings.enable_sound_notifications = True
+
+    with patch('storage.saas_settings_store.a_session_maker', async_session_maker):
+        with pytest.raises(ValueError, match='resolved Agent-Profile'):
+            await store.store(resolved_settings)
+
+        # The private marker alone (a resolved load that fell back carries no
+        # active_agent_profile_id) must also be refused.
+        marked_settings = _make_settings(model='gpt-4o')
+        marked_settings._resolved_view = True
+        with pytest.raises(ValueError, match='resolved Agent-Profile'):
+            await store.store(marked_settings)
+
+    with session_maker() as session:
+        org = session.execute(select(Org).where(Org.id == org_id)).scalars().first()
+        assert org is not None
+        # Nothing was written before the guard fired.
+        assert (org.agent_settings or {}).get('llm', {}).get('model') != (
+            'anthropic/claude-sonnet-4'
+        )
+
+        members = {
+            str(member.user_id): member
+            for member in session.execute(
+                select(OrgMember).where(OrgMember.org_id == org_id)
+            )
+            .scalars()
+            .all()
+        }
+        member1 = members[str(fixture['member1_user_id'])]
+        member2 = members[str(fixture['member2_user_id'])]
+        # Other members keep their own pre-existing LLM, untouched.
+        assert member1.agent_settings_diff['llm']['model'] == 'old-model-v2'
+        assert member2.agent_settings_diff['llm']['model'] == 'old-model-v3'
+
+
+@pytest.mark.asyncio
 async def test_store_keeps_openhands_managed_keys_member_specific(
     session_maker, async_session_maker, org_with_multiple_members_fixture
 ):
@@ -766,10 +831,7 @@ async def test_store_keeps_mcp_config_private_to_acting_member(
     persisted_mcp_config = members[admin_user_id].agent_settings_diff.get('mcp_config')
     assert persisted_mcp_config is not None
     assert 'private-mcp-token' not in str(persisted_mcp_config)
-    assert (
-        persisted_mcp_config['mcpServers']['user1']['headers']['Authorization']
-        != 'Bearer private-mcp-token'
-    )
+    assert persisted_mcp_config['user1']['auth']['value'] != 'private-mcp-token'
     assert 'mcp_config' not in members[member1_user_id].agent_settings_diff
     assert 'mcp_config' not in members[member2_user_id].agent_settings_diff
 
@@ -896,9 +958,9 @@ async def test_store_and_load_mcp_config_via_agent_settings(
 
     assert loaded is not None
     assert loaded.agent_settings.mcp_config is not None
-    admin_server = loaded.agent_settings.mcp_config.mcpServers['admin']
+    admin_server = loaded.agent_settings.mcp_config['admin']
     assert admin_server.url == 'https://admin-private-server.com'
-    assert admin_server.headers['Authorization'] == 'Bearer admin-mcp-token'
+    assert admin_server.auth.value.get_secret_value() == 'admin-mcp-token'
 
 
 def test_persisted_agent_settings_encrypt_secret_fields_without_llm_api_key():
@@ -972,10 +1034,10 @@ def test_persisted_agent_settings_encrypt_secret_fields_without_llm_api_key():
     assert loaded.agent_settings.agent_context.secrets == {
         'AGENT_CONTEXT_TOKEN': 'agent-context-secret'
     }
-    secure_server = loaded.agent_settings.mcp_config.mcpServers['secure']
-    assert secure_server.headers['Authorization'] == 'Bearer mcp-secret-token'
-    stdio_server = loaded.agent_settings.mcp_config.mcpServers['stdio']
-    assert stdio_server.env['MCP_ENV_TOKEN'] == 'mcp-env-secret'
+    secure_server = loaded.agent_settings.mcp_config['secure']
+    assert secure_server.auth.value.get_secret_value() == 'mcp-secret-token'
+    stdio_server = loaded.agent_settings.mcp_config['stdio']
+    assert stdio_server.env['MCP_ENV_TOKEN'].get_secret_value() == 'mcp-env-secret'
 
 
 @pytest.mark.asyncio
@@ -1029,7 +1091,9 @@ async def test_load_drops_legacy_org_level_mcp_config(
 
     # Assert — legacy org mcp_config is not inherited by member1
     assert loaded is not None
-    assert loaded.agent_settings.mcp_config is None
+    # The SDK normalizes ``None`` to ``{}`` so the absence of an MCP config
+    # surfaces as an empty server map rather than ``None``.
+    assert loaded.agent_settings.mcp_config == {}
 
 
 @pytest.mark.asyncio
@@ -1418,11 +1482,10 @@ async def test_store_replaces_mcp_config_on_delete(
             .all()
         }
 
-    admin_servers = (
-        members[admin_user_id]
-        .agent_settings_diff.get('mcp_config', {})
-        .get('mcpServers', {})
-    )
+    # The persisted ``mcp_config`` is the SDK 1.31.x flat server map (no
+    # ``mcpServers`` wrapper), so reach directly into it instead of going
+    # through the legacy wrapper key.
+    admin_servers = members[admin_user_id].agent_settings_diff.get('mcp_config', {})
     assert set(admin_servers.keys()) == {'server1', 'server2'}
     assert 'mcp_config' not in members[member1_user_id].agent_settings_diff
 
